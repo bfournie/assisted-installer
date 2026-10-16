@@ -155,6 +155,13 @@ func (i *installer) InstallNode() error {
 
 	// we can't do any of this if we're installing to the existing root
 	if i.Config.CoreosImage == "" {
+		// Must happen before skipMcoReboot, which replaces the ostree deployment that
+		// coreos-installer 0.27.0 and later embed the firstboot network config into.
+		if err = i.ops.EnsureFirstBootNetworkConfig(nil, i.Device, i.Config.InstallerArgs); err != nil {
+			// Best effort: a node that comes up on DHCP is better than a failed installation.
+			i.log.WithError(err).Warnf("Failed to preserve firstboot network configuration")
+		}
+
 		if i.EnableSkipMcoReboot {
 			i.skipMcoReboot(ignitionPath)
 		}

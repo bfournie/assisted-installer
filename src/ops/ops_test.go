@@ -1316,3 +1316,119 @@ var _ = Describe("Copy registry data", func() {
 		runTest("/dev/dm-0", "/dev/dm-4")
 	})
 })
+
+var _ = Describe("EnsureFirstBootNetworkConfig", func() {
+	const (
+		device     = "/dev/sda"
+		bootPart   = "/dev/sda3"
+		mntPath    = "/mnt/firstboot-boot"
+		networkDir = "/mnt/firstboot-boot/coreos-firstboot-network"
+	)
+
+	var (
+		l        = logrus.New()
+		ctrl     *gomock.Controller
+		execMock *execute.MockExecute
+		o        Ops
+	)
+
+	lsblkOutput := `{
+		"blockdevices": [
+			{
+				"name": "sda",
+				"size": 100000000000,
+				"type": "disk",
+				"children": [
+					{"name": "sda1", "size": 1048576, "type": "part"},
+					{"name": "sda2", "size": 133169152, "type": "part"},
+					{"name": "sda3", "size": 402653184, "type": "part"},
+					{"name": "sda4", "size": 3272588800,"type": "part"}
+				]
+			}
+		]
+	}`
+
+	expectCommand := func(elements ...string) *gomock.Call {
+		return execMock.EXPECT().ExecCommand(gomock.Any(), gomock.Any(),
+			MatcherContainsStringElements{elements, true})
+	}
+
+	expectPartitionLookup := func() {
+		expectCommand("lsblk", "--bytes", "--json", device).Times(1).Return(lsblkOutput, nil)
+	}
+
+	expectBootPartitionMarker := func(present bool) {
+		call := expectCommand("stat", mntPath+"/ostree").Times(1)
+		if present {
+			call.Return("", nil)
+		} else {
+			call.Return("", errors.New("No such file or directory"))
+		}
+	}
+
+	expectMountCycle := func() {
+		expectCommand("mkdir", "-p", mntPath).Times(1).Return("", nil)
+		expectCommand("mount", bootPart, mntPath).Times(1).Return("", nil)
+		expectCommand("umount", mntPath).Times(1).Return("", nil)
+	}
+
+	BeforeEach(func() {
+		ctrl = gomock.NewController(GinkgoT())
+		execMock = execute.NewMockExecute(ctrl)
+		o = NewOpsWithConfig(&config.Config{}, l, execMock)
+	})
+
+	// GinkgoT() does not run the controller's cleanup, so unmet expectations are only
+	// reported if Finish is called explicitly.
+	AfterEach(func() {
+		ctrl.Finish()
+	})
+
+	It("does nothing when --copy-network was not requested", func() {
+		Expect(o.EnsureFirstBootNetworkConfig(nil, device, []string{"--save-partindex", "5"})).To(Succeed())
+	})
+
+	for _, a := range []string{"--copy-network", "-n"} {
+		copyNetworkArg := a
+		It(fmt.Sprintf("copies the keyfiles to the boot partition for %s", copyNetworkArg), func() {
+			expectPartitionLookup()
+			expectMountCycle()
+			expectBootPartitionMarker(true)
+			expectCommand("stat", networkDir).Times(1).Return("", errors.New("No such file or directory"))
+			expectCommand("rsync", "-av", networkManagerKeyfileDir+"/", networkDir+"/").Times(1).Return("", nil)
+
+			Expect(o.EnsureFirstBootNetworkConfig(nil, device, []string{copyNetworkArg})).To(Succeed())
+		})
+	}
+
+	It("leaves a directory already populated by coreos-installer alone", func() {
+		expectPartitionLookup()
+		expectMountCycle()
+		expectBootPartitionMarker(true)
+		expectCommand("stat", networkDir).Times(1).Return("", nil)
+		expectCommand("rsync").Times(0)
+
+		Expect(o.EnsureFirstBootNetworkConfig(nil, device, []string{"--copy-network"})).To(Succeed())
+	})
+
+	It("refuses to write when partition 3 is not the boot partition", func() {
+		expectPartitionLookup()
+		expectMountCycle()
+		expectBootPartitionMarker(false)
+		expectCommand("rsync").Times(0)
+
+		err := o.EnsureFirstBootNetworkConfig(nil, device, []string{"--copy-network"})
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("does not look like the boot partition"))
+	})
+
+	It("unmounts the boot partition when the copy fails", func() {
+		expectPartitionLookup()
+		expectMountCycle()
+		expectBootPartitionMarker(true)
+		expectCommand("stat", networkDir).Times(1).Return("", errors.New("No such file or directory"))
+		expectCommand("rsync", "-av").Times(1).Return("", errors.New("rsync failed"))
+
+		Expect(o.EnsureFirstBootNetworkConfig(nil, device, []string{"--copy-network"})).ToNot(Succeed())
+	})
+})

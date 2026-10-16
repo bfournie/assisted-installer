@@ -111,6 +111,20 @@ func (mr *MockOpsMockRecorder) DryRebootHappened(markerPath any) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DryRebootHappened", reflect.TypeOf((*MockOps)(nil).DryRebootHappened), markerPath)
 }
 
+// EnsureFirstBootNetworkConfig mocks base method.
+func (m *MockOps) EnsureFirstBootNetworkConfig(liveLogger io.Writer, device string, installerArgs []string) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "EnsureFirstBootNetworkConfig", liveLogger, device, installerArgs)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// EnsureFirstBootNetworkConfig indicates an expected call of EnsureFirstBootNetworkConfig.
+func (mr *MockOpsMockRecorder) EnsureFirstBootNetworkConfig(liveLogger, device, installerArgs any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EnsureFirstBootNetworkConfig", reflect.TypeOf((*MockOps)(nil).EnsureFirstBootNetworkConfig), liveLogger, device, installerArgs)
+}
+
 // EvaluateDiskSymlink mocks base method.
 func (m *MockOps) EvaluateDiskSymlink(arg0 string) string {
 	m.ctrl.T.Helper()

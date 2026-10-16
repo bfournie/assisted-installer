@@ -46,6 +46,11 @@ const (
 	registryDataDirOnDevice         = "var/lib/iri-registry"
 	registryDataDirOnMnt            = "/mnt/agentdata"
 	ostreeDeployPath                = "/mnt/root/ostree/deploy/rhcos"
+	networkManagerKeyfileDir        = "/etc/NetworkManager/system-connections"
+	firstBootNetworkDirName         = "coreos-firstboot-network"
+	firstBootNetworkMntPath         = "/mnt/firstboot-boot"
+	bootPartitionIndex              = "3"
+	bootPartitionMarkerDir          = "ostree"
 )
 
 //go:generate mockgen -source=ops.go -package=ops -destination=mock_ops.go
@@ -76,6 +81,7 @@ type Ops interface {
 	GetEncapsulatedMC(ignitionPath string) (*mcfgv1.MachineConfig, error)
 	OverwriteOsImage(osImage, device string, extraArgs []string) error
 	CopyRegistryData(liveLogger io.Writer, device string) error
+	EnsureFirstBootNetworkConfig(liveLogger io.Writer, device string, installerArgs []string) error
 }
 
 const (
@@ -241,6 +247,77 @@ func (o *ops) configureFirstBootNetworking(liveLogger io.Writer, installerArgs [
 	out, err = o.ExecPrivilegeCommand(liveLogger, "rsync", "-av", "/etc/NetworkManager/system-connections/", "/boot/coreos-firstboot-network/")
 	if err != nil {
 		return errors.Wrapf(err, "failed to copy network files to firstboot network directory: %s", out)
+	}
+
+	return nil
+}
+
+// EnsureFirstBootNetworkConfig makes sure that the firstboot network configuration requested via
+// --copy-network survives the OS image replacement that OverwriteOsImage performs after the image
+// has been written to disk.
+//
+// coreos-installer 0.27.0 changed --copy-network to embed the NetworkManager keyfiles into the
+// initramfs of the ostree deployment that exists at install time, rather than writing them to
+// <boot>/coreos-firstboot-network as older versions did. OverwriteOsImage then replaces that
+// deployment with the one from the release payload, so the embedded copy is discarded and the node
+// boots without its static network configuration (OCPBUGS-130597).
+//
+// Writing the keyfiles to the root of the boot partition keeps them outside of any deployment, so
+// they survive the replacement and are picked up on firstboot. When coreos-installer already
+// populated that directory, which is the case for 0.26.0 and older, this is a no-op.
+func (o *ops) EnsureFirstBootNetworkConfig(liveLogger io.Writer, device string, installerArgs []string) error {
+	if !slices.Contains(installerArgs, "--copy-network") && !slices.Contains(installerArgs, "-n") {
+		return nil
+	}
+
+	bootPartition, err := o.getPartitionPathFromLsblk(device, bootPartitionIndex)
+	if err != nil {
+		return errors.Wrapf(err, "failed to find partition %s for device %s", bootPartitionIndex, device)
+	}
+
+	if err = o.Mkdir(firstBootNetworkMntPath); err != nil {
+		return errors.Wrapf(err, "failed to create mount point %s", firstBootNetworkMntPath)
+	}
+	if err = utils.Retry(3, 5*time.Second, o.log, func() (err error) {
+		_, err = o.ExecPrivilegeCommand(nil, "mount", bootPartition, firstBootNetworkMntPath)
+		return
+	}); err != nil {
+		return errors.Wrapf(err, "failed to mount boot partition %s", bootPartition)
+	}
+	defer func() {
+		// Leaking this mount matters: OverwriteOsImage mounts the same filesystem at
+		// /mnt/boot and freezes it before the node reboots, which would leave it frozen
+		// and still mounted here.
+		if umountErr := utils.Retry(3, 5*time.Second, o.log, func() (err error) {
+			_, err = o.ExecPrivilegeCommand(nil, "umount", firstBootNetworkMntPath)
+			return
+		}); umountErr != nil {
+			o.log.WithError(umountErr).Errorf("Failed to unmount %s, boot partition may be left mounted",
+				firstBootNetworkMntPath)
+		}
+	}()
+
+	// Installer args such as --save-partindex can produce unusual layouts, so identify the boot
+	// partition before writing to it. The filesystem label is not usable for this: udev has not
+	// necessarily re-probed a partition that coreos-installer has only just written, so it often
+	// reads back empty. The ostree directory is a positive marker and is already on disk by the
+	// time the image has been written.
+	if !o.FileExists(filepath.Join(firstBootNetworkMntPath, bootPartitionMarkerDir)) {
+		return errors.Errorf("refusing to write firstboot network config: %s has no %s directory, "+
+			"it does not look like the boot partition", bootPartition, bootPartitionMarkerDir)
+	}
+
+	networkDir := filepath.Join(firstBootNetworkMntPath, firstBootNetworkDirName)
+	if o.FileExists(networkDir) {
+		o.log.Infof("%s was already populated by coreos-installer, leaving it alone", firstBootNetworkDirName)
+		return nil
+	}
+
+	o.log.Infof("copying network files from %s to %s on the installed boot partition",
+		networkManagerKeyfileDir, firstBootNetworkDirName)
+	out, err := o.ExecPrivilegeCommand(liveLogger, "rsync", "-av", networkManagerKeyfileDir+"/", networkDir+"/")
+	if err != nil {
+		return errors.Wrapf(err, "failed to copy network files to %s: %s", networkDir, out)
 	}
 
 	return nil
